@@ -153,6 +153,7 @@ const STORAGE_KEY = 'tracker-data-v1';
 let state = null;
 let ui = { tab:'oggi', day:'push', logDate: todayISO(), progExercise:null, editingExerciseId:null };
 let saveTimer = null;
+let backupTimer = null;
 
 function todayISO(){ return new Date().toISOString().slice(0,10); }
 function uid(){ return 'x'+Math.random().toString(36).slice(2,9); }
@@ -162,7 +163,7 @@ function fmtDate(iso){
 }
 
 function defaultState(){
-  return { exercises: DEFAULT_EXERCISES.slice(), sessions: [], bodyweight: [], dailyLog: {}, lastDay: 'push' };
+  return { exercises: DEFAULT_EXERCISES.slice(), sessions: [], bodyweight: [], dailyLog: {}, lastDay: 'push', syncUrl: '' };
 }
 
 async function loadState(){
@@ -178,6 +179,7 @@ async function loadState(){
   if(!state.bodyweight) state.bodyweight = [];
   if(!state.dailyLog) state.dailyLog = {};
   if(!state.lastDay) state.lastDay = 'push';
+  if(state.syncUrl===undefined) state.syncUrl = '';
 }
 
 function saveState(){
@@ -186,6 +188,69 @@ function saveState(){
     try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
     catch(e){ console.error('Storage error', e); }
   }, 250);
+  scheduleCloudBackup();
+}
+
+function scheduleCloudBackup(){
+  if(!state.syncUrl) return;
+  clearTimeout(backupTimer);
+  backupTimer = setTimeout(()=>{
+    fetch(state.syncUrl, {
+      method:'POST',
+      headers:{ 'Content-Type':'text/plain' },
+      body: JSON.stringify({ type:'backup', json: JSON.stringify(state) })
+    }).catch(()=>{});
+  }, 4000);
+}
+
+function exportBackupFile(){
+  const blob = new Blob([JSON.stringify(state, null, 2)], { type:'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'ledger-backup-' + todayISO() + '.json';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function applyRestoredState(parsed){
+  state = parsed;
+  if(!state.exercises) state.exercises = [];
+  if(!state.sessions) state.sessions = [];
+  if(!state.bodyweight) state.bodyweight = [];
+  if(!state.dailyLog) state.dailyLog = {};
+  if(!state.lastDay) state.lastDay = 'push';
+  if(state.syncUrl===undefined) state.syncUrl = '';
+  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
+  render();
+}
+
+function importBackupFile(file){
+  const reader = new FileReader();
+  reader.onload = ()=>{
+    try{
+      applyRestoredState(JSON.parse(reader.result));
+    }catch(e){
+      alert('Il file non sembra un backup valido.');
+    }
+  };
+  reader.readAsText(file);
+}
+
+function restoreFromCloud(){
+  if(!state.syncUrl) return;
+  fetch(state.syncUrl + '?backup=1')
+    .then(r=>r.json())
+    .then(data=>{
+      if(data && data.json){
+        applyRestoredState(JSON.parse(data.json));
+      } else {
+        alert('Nessun backup trovato nel cloud.');
+      }
+    })
+    .catch(()=>{ alert('Impossibile contattare il backup nel cloud.'); });
 }
 
 /* ---------- utilita di dominio ---------- */
@@ -321,6 +386,32 @@ function renderDailyLog(){
   `;
   card.appendChild(row);
 
+  const syncStatus = document.createElement('div');
+  syncStatus.style.fontSize = '11px';
+  syncStatus.style.color = 'var(--ink-soft)';
+  syncStatus.style.marginTop = '6px';
+  syncStatus.textContent = state.syncUrl ? '' : '';
+  card.appendChild(syncStatus);
+
+  const details = document.createElement('details');
+  details.style.marginTop = '10px';
+  details.innerHTML = `<summary style="cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--ink-soft);text-transform:uppercase;">Sincronizzazione automatica</summary>`;
+  const syncRow = document.createElement('div');
+  syncRow.className = 'row';
+  syncRow.style.marginTop = '10px';
+  syncRow.innerHTML = `
+    <input type="text" id="dl-syncurl" placeholder="Incolla qui l'URL del Web App" value="${state.syncUrl||''}" style="flex:1;min-width:200px;">
+    <button class="secondary" id="dl-syncsave">Salva</button>
+  `;
+  details.appendChild(syncRow);
+  card.appendChild(details);
+
+  syncRow.querySelector('#dl-syncsave').onclick = ()=>{
+    state.syncUrl = syncRow.querySelector('#dl-syncurl').value.trim();
+    saveState();
+    render();
+  };
+
   function updateRemaining(){
     const t = Number(row.querySelector('#dl-target').value)||0;
     const cns = Number(row.querySelector('#dl-consumed').value)||0;
@@ -342,6 +433,24 @@ function renderDailyLog(){
   row.querySelector('#dl-target').addEventListener('input', save);
   row.querySelector('#dl-consumed').addEventListener('input', save);
 
+  if(state.syncUrl){
+    syncStatus.textContent = 'Sincronizzazione in corso…';
+    fetch(state.syncUrl + '?date=' + ui.logDate)
+      .then(r=>r.json())
+      .then(data=>{
+        const entry = (data && data[ui.logDate]) ? data[ui.logDate] : data;
+        if(entry && (entry.sleepHours || entry.calorieConsumed)){
+          if(entry.sleepHours) row.querySelector('#dl-sleep').value = entry.sleepHours;
+          if(entry.calorieConsumed) row.querySelector('#dl-consumed').value = entry.calorieConsumed;
+          save();
+          syncStatus.textContent = 'Sincronizzato da Apple Health.';
+        } else {
+          syncStatus.textContent = 'Nessun dato ancora ricevuto per questa data.';
+        }
+      })
+      .catch(()=>{ syncStatus.textContent = 'Sincronizzazione non riuscita — controlla l\'URL.'; });
+  }
+
   return card;
 }
 
@@ -354,8 +463,47 @@ function lastCalorieTarget(){
   return '';
 }
 
+function renderBackupPanel(){
+  const card = document.createElement('div');
+  card.className = 'card';
+  const details = document.createElement('details');
+  details.innerHTML = `<summary style="cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--ink-soft);text-transform:uppercase;">Backup dati</summary>`;
+
+  const info = document.createElement('div');
+  info.style.fontSize = '12px';
+  info.style.color = 'var(--ink-soft)';
+  info.style.margin = '10px 0';
+  info.textContent = state.syncUrl
+    ? 'Backup automatico attivo verso il tuo Google Sheet ad ogni modifica.'
+    : 'Configura la Sincronizzazione automatica qui sopra per avere anche il backup nel cloud.';
+  details.appendChild(info);
+
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML = `
+    <button class="secondary" id="bk-export">⬇ Esporta backup (.json)</button>
+    <button class="secondary" id="bk-import-btn">⬆ Importa backup</button>
+    <input type="file" id="bk-import-file" accept="application/json" style="display:none;">
+    ${state.syncUrl ? '<button class="ghost" id="bk-restore-cloud">↻ Ripristina dal cloud</button>' : ''}
+  `;
+  details.appendChild(row);
+  card.appendChild(details);
+
+  row.querySelector('#bk-export').onclick = exportBackupFile;
+  const fileInput = row.querySelector('#bk-import-file');
+  row.querySelector('#bk-import-btn').onclick = ()=> fileInput.click();
+  fileInput.onchange = ()=>{
+    if(fileInput.files[0]) importBackupFile(fileInput.files[0]);
+  };
+  const restoreBtn = row.querySelector('#bk-restore-cloud');
+  if(restoreBtn) restoreBtn.onclick = restoreFromCloud;
+
+  return card;
+}
+
 function renderOggi(c){
   c.appendChild(renderDailyLog());
+  c.appendChild(renderBackupPanel());
 
   const card = document.createElement('div');
   card.className = 'card';
